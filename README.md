@@ -8,7 +8,8 @@
 <h1 align="center">🌌 Federated Anomaly Detection for High-Energy Physics</h1>
 
 <p align="center">
-  <strong>An end-to-end, privacy-preserving machine learning pipeline using Federated Averaging (FedAvg) to collaboratively detect rare particle decay anomalies across multiple simulated research institutions.</strong>
+  <strong>An end-to-end, privacy-preserving machine learning pipeline using Federated Averaging (FedAvg) to collaboratively detect rare particle decay anomalies across multiple simulated research institutions.</strong><br><br>
+  <em>In collaboration with <a href="https://github.com/Hiral373">@Hiral373</a></em>
 </p>
 
 ---
