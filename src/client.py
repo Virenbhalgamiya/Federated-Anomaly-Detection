@@ -1,96 +1,62 @@
-import flwr as fl
-import torch
-import torch.nn as nn
+"""Federated client: local VAE training, optional DP-SGD (Opacus) with cumulative accounting."""
 from collections import OrderedDict
-from .model import get_model, train
+from dataclasses import dataclass
 
-class AutoencoderClient(fl.client.NumPyClient):
-    def __init__(self, input_dim, trainloader, device):
-        self.model = get_model(input_dim)
-        self.trainloader = trainloader
-        self.device = device
-        self.criterion = nn.MSELoss()
-        
-    def get_parameters(self, config):
-        return [val.cpu().numpy() for key, val in self.model.state_dict().items() if not key.endswith('num_batches_tracked')]
+import torch
+from opacus import PrivacyEngine
+from torch.utils.data import DataLoader, TensorDataset
 
-    def set_parameters(self, parameters):
-        # Opacus might wrap self.model into GradSampleModule. If so, loading standard dict fails.
-        # But set_parameters runs BEFORE make_private, so self.model is usually standard here,
-        # unless it persisted from previous rounds. Handle both cases cleanly.
-        try:
-            params_dict = zip(self.model.state_dict().keys(), parameters)
-            state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
-            self.model.load_state_dict(state_dict, strict=False)
-        except Exception:
-            pass
+from .model import get_model, train_epochs
 
-    def fit(self, parameters, config):
-        self.set_parameters(parameters)
-        
-        # Hyperparameters can be passed via config from the server
-        lr = config.get("lr", 0.001)
-        epochs = config.get("local_epochs", 1)
-        prox_mu = config.get("prox_mu", 0.01) # FedProx proximal term weight
-        
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
-        
-        # 1. Opacus Differential Privacy Setup
-        from opacus import PrivacyEngine
-        privacy_engine = PrivacyEngine()
-        
-        # Make the model, optimizer, and dataloader private
-        # We wrap in a try block in case the model is already wrapped from a previous round
-        try:
-            self.model, optimizer, self.trainloader = privacy_engine.make_private(
-                module=self.model,
-                optimizer=optimizer,
-                data_loader=self.trainloader,
-                noise_multiplier=1.0,  # DP noise
-                max_grad_norm=1.0,     # DP clipping
-            )
-        except ValueError:
-            # Already attached
-            pass
-            
-        # 2. FedProx - save a static copy of the global model before local training begins
-        import copy
-        global_model = copy.deepcopy(self.model)
-        global_model.eval()
-        
-        loss = 0.0
-        for _ in range(epochs):
-            loss = train(
-                self.model, 
-                self.trainloader, 
-                optimizer, 
-                self.criterion, 
-                self.device, 
-                epochs=1,
-                prox_mu=prox_mu,
-                global_model=global_model
-            )
-            
-        # Extract privacy budget spent
-        epsilon = privacy_engine.get_epsilon(delta=1e-5)
-            
-        # Opacus wraps the model in a GradSampleModule which changes parameter names (adds _module.)
-        # We need to extract the base parameters safely.
-        # get_parameters below will just export the state dict of the model.
-        # But we must ensure it matches the original shape if Opacus modified it.
-        # Fortunately, Opacus keeps state_dict shapes identical.
-        return self.get_parameters(config={}), len(self.trainloader.dataset), {"loss": loss, "epsilon": epsilon}
 
-def get_client_fn(trainloaders, input_dim):
-    """
-    Returns a function that spawns a client. Used by Flower simulation.
-    """
-    def client_fn(cid: str) -> fl.client.Client:
-        # Load the partition for this client
-        trainloader = trainloaders[int(cid)]
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Create and return client
-        return AutoencoderClient(input_dim, trainloader, device)
-    
-    return client_fn
+@dataclass
+class FLConfig:
+    n_clients: int = 3
+    rounds: int = 20
+    local_epochs: int = 2
+    batch_size: int = 64
+    lr: float = 1e-3
+    noise_multiplier: float = 0.0   # 0 disables DP
+    max_grad_norm: float = 1.0
+    delta: float = 1e-5
+    prox_mu: float = 0.0            # 0 disables FedProx
+
+
+class Client:
+    """One institution. The client (and its privacy accountant) lives for the whole run,
+    so epsilon accumulates across rounds instead of resetting each round."""
+
+    def __init__(self, X, input_dim, cfg, device="cpu"):
+        self.cfg, self.device = cfg, device
+        dataset = TensorDataset(torch.as_tensor(X, dtype=torch.float32))
+        loader = DataLoader(dataset, batch_size=cfg.batch_size, shuffle=True)
+        self.n = len(dataset)
+        model = get_model(input_dim).to(device)
+        opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+        self.engine = None
+        if cfg.noise_multiplier > 0:
+            self.engine = PrivacyEngine(accountant="rdp")
+            model, opt, loader = self.engine.make_private(
+                module=model, optimizer=opt, data_loader=loader,
+                noise_multiplier=cfg.noise_multiplier, max_grad_norm=cfg.max_grad_norm)
+        self.model, self.opt, self.loader = model, opt, loader
+
+    @property
+    def base(self):
+        return getattr(self.model, "_module", self.model)  # unwrap Opacus' GradSampleModule
+
+    def get_parameters(self):
+        return OrderedDict((k, v.detach().cpu().clone()) for k, v in self.base.state_dict().items())
+
+    def set_parameters(self, params):
+        self.base.load_state_dict(params, strict=True)  # raises on any mismatch, never silent
+
+    def fit(self):
+        use_prox = self.cfg.prox_mu > 0
+        ref = [p.detach().clone() for p in self.base.parameters()] if use_prox else None
+        loss = train_epochs(self.model, self.opt, self.loader, self.cfg.local_epochs, self.device,
+                            prox_ref=ref, prox_mu=self.cfg.prox_mu, lr=self.cfg.lr)
+        return self.get_parameters(), self.n, loss
+
+    def epsilon(self):
+        return self.engine.get_epsilon(self.cfg.delta) if self.engine else float("inf")

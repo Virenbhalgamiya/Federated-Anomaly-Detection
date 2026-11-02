@@ -1,93 +1,68 @@
+"""Data loading, splitting and client partitioning for the MAGIC Gamma Telescope dataset.
+
+MAGIC (OpenML id 1120) is real Cherenkov-telescope data: gamma showers ('g', signal) versus
+hadronic showers ('h', background). We treat gamma as "normal" and hadron as the "anomaly".
+Hadrons are ~35% of the data, so this is a binary-separation benchmark for an anomaly detector,
+not a rare-event search.
+"""
+from dataclasses import dataclass
+
 import numpy as np
-import torch
-from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
-class ParticleDetectorDataset(Dataset):
-    def __init__(self, data, labels=None):
-        self.data = torch.tensor(data, dtype=torch.float32)
-        self.labels = torch.tensor(labels, dtype=torch.float32) if labels is not None else None
 
-    def __len__(self):
-        return len(self.data)
+@dataclass
+class Splits:
+    X_train_normal: np.ndarray  # normal-only training data (what the clients see)
+    X_val: np.ndarray           # used for model selection and the decision threshold
+    y_val: np.ndarray
+    X_test: np.ndarray          # touched once, at the end
+    y_test: np.ndarray
+    input_dim: int
 
-    def __getitem__(self, idx):
-        if self.labels is not None:
-            return self.data[idx], self.labels[idx]
-        return self.data[idx]
 
-def download_and_preprocess_magic_dataset():
-    """
-    Downloads the real MAGIC Gamma Telescope dataset from OpenML.
-    This is an astrophysics dataset used to distinguish gamma rays (signal) 
-    from hadronic showers (background/normal).
-    """
-    import pandas as pd
+def load_magic():
+    """Download MAGIC from OpenML. Fails loudly: there is no silent synthetic fallback."""
     from sklearn.datasets import fetch_openml
-    
-    print("  [Data] Downloading true physics dataset (MAGIC Gamma Telescope)...")
-    try:
-        # data_id=1120 is the MAGIC Gamma Telescope dataset on OpenML
-        dataset = fetch_openml(data_id=1120, parser='auto', as_frame=True)
-        df = dataset.frame
-        target_name = dataset.target_names[0] if isinstance(dataset.target_names, list) else dataset.target_names
-    except Exception as e:
-        print(f"  [Data] Failed to download from OpenML: {e}")
-        # Fallback to random data if openml is down
-        print("  [Data] Falling back to synthetic simulation...")
-        return generate_simulated_physics_data()
-        
-    # Class 'h' (hadron) is the background -> mapped to class 1 (Anomaly here for test)
-    # Class 'g' (gamma) is the signal -> mapped to class 0 (Normal)
-    df['label'] = dataset.target.apply(lambda x: 1 if x == 'h' else 0)
-    
-    X = df.drop([target_name, 'label'], axis=1, errors='ignore').values
-    y = df['label'].values
-    
-    # Shuffle the dataset
-    np.random.seed(42)
-    idx = np.random.permutation(len(X))
-    X, y = X[idx], y[idx]
-    
-    print(f"  [Data] Loaded {len(X)} samples with {X.shape[1]} features.")
-    print(f"  [Data] Normal samples: {np.sum(y == 0)} | Anomalous samples: {np.sum(y == 1)}")
-    
+
+    dataset = fetch_openml(data_id=1120, as_frame=True, parser="auto")
+    df = dataset.frame
+    target_name = dataset.target_names[0] if isinstance(dataset.target_names, list) else dataset.target_names
+    y = (dataset.target.astype(str) == "h").astype(int).values
+    X = df.drop(columns=[target_name]).values.astype(np.float64)
     return X, y
 
-def get_federated_dataloaders(n_clients=3, batch_size=64, validation_split=0.2):
+
+def make_splits(X, y, seed, val_size=0.2, test_size=0.2):
+    """Stratified train/val/test split. The scaler is fit on normal training data only."""
+    X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=test_size, stratify=y, random_state=seed)
+    X_tr, X_va, y_tr, y_va = train_test_split(
+        X_tr, y_tr, test_size=val_size / (1 - test_size), stratify=y_tr, random_state=seed)
+    X_norm = X_tr[y_tr == 0]
+    scaler = StandardScaler().fit(X_norm)
+    return Splits(
+        X_train_normal=scaler.transform(X_norm),
+        X_val=scaler.transform(X_va), y_val=y_va,
+        X_test=scaler.transform(X_te), y_test=y_te,
+        input_dim=X.shape[1],
+    )
+
+
+def partition(X, n_clients, mode, seed):
+    """Split normal training data across clients.
+
+    iid:     random equal split.
+    noniid:  feature-skew. Samples are ordered along the first principal component and cut into
+             contiguous slices, so each client sees a different region of the normal distribution.
     """
-    Downloads, scales, and splits real physics data among federated clients 
-    and a centralized validation set.
-    """
-    X, y = download_and_preprocess_magic_dataset()
-    
-    # Scale data
-    scaler = StandardScaler()
-    X = scaler.fit_transform(X)
-
-    # Split off a centralized test set for final server-side evaluation or centralized testing
-    X_train_val, X_test, y_train_val, y_test = train_test_split(X, y, test_size=validation_split, random_state=42)
-
-    # Note: Unsupervised anomaly detection Autoencoder only trains on normal data.
-    # The clients should ideally only see normal data representing standard operating conditions.
-    # But for federated settings, clients just train on what they have. 
-    # We will filter train data to ONLY normal samples for training the AE.
-    normal_mask = (y_train_val == 0)
-    X_train_normal = X_train_val[normal_mask]
-
-    # Partition training data among clients
-    partitions = np.array_split(X_train_normal, n_clients)
-    
-    trainloaders = []
-    
-    for partition in partitions:
-        # AE reconstructs input, so target is input itself
-        dataset = ParticleDetectorDataset(partition, partition)
-        trainloaders.append(DataLoader(dataset, batch_size=batch_size, shuffle=True))
-    
-    # Server / Test dataset (contains both normal and anomalies to evaluate ROC AUC)
-    test_dataset = ParticleDetectorDataset(X_test, y_test)
-    testloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-
-    return trainloaders, testloader, X_train_normal.shape[1]
+    rng = np.random.default_rng(seed)
+    if mode == "iid":
+        chunks = np.array_split(rng.permutation(len(X)), n_clients)
+    elif mode == "noniid":
+        Xc = X - X.mean(axis=0)
+        _, _, vt = np.linalg.svd(Xc, full_matrices=False)
+        chunks = np.array_split(np.argsort(Xc @ vt[0]), n_clients)
+    else:
+        raise ValueError(f"unknown partition mode: {mode}")
+    return [X[c] for c in chunks]

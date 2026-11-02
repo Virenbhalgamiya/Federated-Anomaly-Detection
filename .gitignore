@@ -29,3 +29,7 @@ Thumbs.db
 
 # Project specific
 magic04.csv
+
+# Local run artifacts
+results/run.log
+.pytest_cache/

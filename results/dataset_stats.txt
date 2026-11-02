@@ -1,0 +1,1 @@
+MAGIC (OpenML 1120): 19020 samples, 10 features; normal (gamma) 12332, anomaly (hadron) 6688 (35.2% anomalous)

@@ -1,41 +1,31 @@
-import flwr as fl
+"""Quick demo: one federated run (FedAvg + DP-SGD) on MAGIC, evaluated on a held-out test set.
+
+For the full study (baselines, privacy sweep, FedProx, several seeds) use run_experiments.py.
+"""
 import os
 import sys
 
-# Ensure src modules can be imported
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from src.data import get_federated_dataloaders
-from src.server import simulate_fedavg
-from src.report import evaluate_and_report
+from src.client import FLConfig
+from src.data import load_magic, make_splits, partition
+from src.server import run_federated
 
-def main():
-    print("=" * 60)
-    print("🚀 Starting Federated Anomaly Detection Pipeline")
-    print("=" * 60)
-    
-    NUM_CLIENTS = 3
-    NUM_ROUNDS = 5
-    
-    print("\n[1/4] Generating simulated HD physics data...")
-    trainloaders, testloader, input_dim = get_federated_dataloaders(n_clients=NUM_CLIENTS)
-    print(f"✅ Created {NUM_CLIENTS} client partitions. Input dim: {input_dim}")
-    
-    print("\n[2/4] Setting up Federated Learning infrastructure...")
-    # Skipping heavy flwr Ray requirements. Running synchronously.
-    
-    print("\n[3/4] Starting Federated Simulation (FedAvg)...")
-    history = simulate_fedavg(
-        models=None,
-        trainloaders=trainloaders,
-        testloader=testloader,
-        input_dim=input_dim,
-        num_rounds=NUM_ROUNDS,
-        local_epochs=1
-    )
-    
-    print("\n[4/4] Evaluating Global Model and Generating Reports...")
-    evaluate_and_report(history, testloader, input_dim)
+
+def main(seed=0, noise_multiplier=1.0):
+    X, y = load_magic()
+    splits = make_splits(X, y, seed)
+    cfg = FLConfig(noise_multiplier=noise_multiplier)
+    clients = partition(splits.X_train_normal, cfg.n_clients, "iid", seed)
+    print(f"{len(clients)} clients, sizes {[len(c) for c in clients]}, "
+          f"DP noise multiplier {cfg.noise_multiplier}, {cfg.rounds} rounds")
+    test, history = run_federated(clients, splits, cfg, seed)
+    for h in history[:: max(1, len(history) // 5)]:
+        print(f"  round {h['round']:2d}  val AUC {h['val_auc']:.4f}  epsilon so far {h['epsilon']:.2f}")
+    print(f"\nTest ROC AUC {test['auc']:.4f} | AUPRC {test['auprc']:.4f} | F1 {test['f1']:.4f} "
+          f"| precision {test['precision']:.4f} | recall {test['recall']:.4f}")
+    print(f"Total privacy budget epsilon = {test['epsilon']:.2f} at delta = {cfg.delta:g}")
+
 
 if __name__ == "__main__":
     main()
